@@ -10,12 +10,15 @@ from sqlalchemy.orm import Session
 
 from ..config import LATE_ARRIVAL_SECONDS
 from ..db import get_db
-from ..models import (ConfigVersion, Consist, Device, EnergyFragment, GridCell,
-                      Line, MeterReading, Metric, Reconciliation, Run, RunEvent,
+from ..models import (AbsorptionDevice, AbsorptionStatus, ConfigVersion, Consist,
+                      Device, EnergyFragment, GridCell, Line, MeterReading,
+                      Metric, RegenDerivation, Reconciliation, Run, RunEvent,
                       RunSegment, Section, Train, User)
 from ..services.evaluate import evaluate_run, rebuild_grid
 from ..services.metrics import publish_run_metrics, reprocess_run
 from ..services.reconcile import reconcile_grid_aligned, reconcile_run_aligned
+from ..services.regen import (DEST_LABEL, auto_rederive_after_status, derive,
+                              derive_both, route_advice)
 
 router = APIRouter(prefix="/api")
 
@@ -83,6 +86,8 @@ def catalog(db: Session = Depends(get_db), _: User = Depends(current_user)):
         "sections": [{"id": s.id, "line_id": s.line_id, "code": s.code, "name": s.name,
                       "seq": s.seq, "length_km": s.length_km,
                       "multiplier_zone": s.multiplier_zone,
+                      "supply_zone": s.supply_zone,
+                      "gradient_permille": s.gradient_permille,
                       "substation_device_id": s.substation_device_id} for s in sections],
         "trains": [{"id": t.id, "code": t.code, "vehicle_model": t.vehicle_model} for t in trains],
         "devices": [{"id": d.id, "serial": d.serial, "kind": d.kind,
@@ -108,6 +113,7 @@ class ReadingIn(BaseModel):
     export_cum: Optional[float] = None
     multiplier: float = 1.0
     comm_status: str = "OK"
+    absorb_cum: Optional[float] = None
 
 
 @router.post("/readings")
@@ -126,7 +132,8 @@ def ingest_readings(body: list[ReadingIn], db: Session = Depends(get_db),
                             received_at=received, seq=item.seq,
                             traction_cum=item.traction_cum, regen_cum=item.regen_cum,
                             aux_cum=item.aux_cum, import_cum=item.import_cum,
-                            export_cum=item.export_cum, multiplier=item.multiplier,
+                            export_cum=item.export_cum, absorb_cum=item.absorb_cum,
+                            multiplier=item.multiplier,
                             comm_status=item.comm_status))
         inserted += 1
         if is_late and device.kind == "ONBOARD":
@@ -165,7 +172,8 @@ def list_readings(device_id: Optional[int] = None, limit: int = 200,
              "received_at": r.received_at.isoformat(), "seq": r.seq,
              "traction_cum": r.traction_cum, "regen_cum": r.regen_cum,
              "aux_cum": r.aux_cum, "import_cum": r.import_cum,
-             "export_cum": r.export_cum, "multiplier": r.multiplier,
+             "export_cum": r.export_cum, "absorb_cum": r.absorb_cum,
+             "multiplier": r.multiplier,
              "comm_status": r.comm_status,
              "late": (r.received_at - r.sampled_at).total_seconds() > LATE_ARRIVAL_SECONDS}
             for r in rows]
@@ -343,3 +351,119 @@ def list_config_versions(db: Session = Depends(get_db), _: User = Depends(curren
              "valid_to": c.valid_to.isoformat() if c.valid_to else None,
              "note": c.note}
             for c in db.query(ConfigVersion).order_by(ConfigVersion.valid_from).all()]
+
+
+# ---------------- 回馈去向推导 ----------------
+
+def _derivation_json(d: RegenDerivation) -> dict:
+    return {
+        "id": d.id, "run_id": d.run_id, "run_version": d.run_version,
+        "route": d.route, "version": d.version, "status": d.status,
+        "range_start": d.range_start.isoformat(), "range_end": d.range_end.isoformat(),
+        "regen_available": d.regen_available, "destinations": d.destinations,
+        "eligibility": d.eligibility, "allocations": d.allocations,
+        "basis": d.basis, "warnings": d.warnings,
+        "supersedes_id": d.supersedes_id, "created_at": d.created_at.isoformat(),
+        "dest_label": DEST_LABEL,
+    }
+
+
+@router.get("/runs/{run_id}/regen")
+def run_regen(run_id: int, route: Optional[str] = None,
+              db: Session = Depends(get_db), _: User = Depends(current_user)):
+    """回馈去向:返回两条路线各自的最新版本(可按 route 过滤),历史版本用 all_versions。"""
+    run = db.get(Run, run_id)
+    if not run:
+        raise HTTPException(404, "运行不存在")
+    q = db.query(RegenDerivation).filter(RegenDerivation.run_id == run_id)
+    if route:
+        q = q.filter(RegenDerivation.route == route)
+    rows = q.order_by(RegenDerivation.route, RegenDerivation.version.desc()).all()
+    latest: dict[str, RegenDerivation] = {}
+    history = []
+    for d in rows:
+        latest.setdefault(d.route, d)
+        history.append({"id": d.id, "route": d.route, "version": d.version,
+                        "status": d.status, "created_at": d.created_at.isoformat(),
+                        "supersedes_id": d.supersedes_id})
+    return {"run_id": run_id, "run_key": run.run_key, "run_version": run.version,
+            "routes": {k: _derivation_json(v) for k, v in latest.items()},
+            "history": history}
+
+
+@router.post("/runs/{run_id}/regen/derive")
+def run_regen_derive(run_id: int, route: str = "BOTH", note_at: Optional[datetime] = None,
+                     db: Session = Depends(get_db), _: User = Depends(current_user)):
+    """重新推导回馈去向。再次调用生成新版本(旧版本保留),不追溯改写历史结论。
+    note_at 可作为"此刻到达"的截止时间,用于复现状态晚到前后的差异。"""
+    run = db.get(Run, run_id)
+    if not run:
+        raise HTTPException(404, "运行不存在")
+    if route == "BOTH":
+        recs = derive_both(db, run) if note_at is None else {
+            "CONSERVATION": derive(db, run, "CONSERVATION", cutoff=note_at),
+            "LEARNED": derive(db, run, "LEARNED", cutoff=note_at)}
+    else:
+        recs = {route: derive(db, run, route, cutoff=note_at)}
+    db.commit()
+    return {k: _derivation_json(v) for k, v in recs.items()}
+
+
+@router.get("/runs/{run_id}/regen/advice")
+def run_regen_advice(run_id: int, db: Session = Depends(get_db),
+                     _: User = Depends(current_user)):
+    run = db.get(Run, run_id)
+    if not run:
+        raise HTTPException(404, "运行不存在")
+    return route_advice(db, run)
+
+
+class AbsorptionStatusIn(BaseModel):
+    device_serial: str
+    state: str                 # AVAILABLE|LIMITED|FAULT|OFFLINE
+    observed_at: datetime
+    received_at: Optional[datetime] = None
+    max_absorb_kwh_per_min: Optional[float] = None
+    note: Optional[str] = None
+
+
+@router.post("/absorption-status")
+def ingest_absorption_status(body: AbsorptionStatusIn, db: Session = Depends(get_db),
+                             _: User = Depends(current_user)):
+    """吸收装置状态接入。状态晚到只对受影响分区内已发布运行生成新的去向版本。"""
+    dev = (db.query(AbsorptionDevice)
+           .filter(AbsorptionDevice.serial == body.device_serial).first())
+    if not dev:
+        raise HTTPException(400, f"未知吸收装置 {body.device_serial}")
+    if body.state not in ("AVAILABLE", "LIMITED", "FAULT", "OFFLINE"):
+        raise HTTPException(400, "state 必须为 AVAILABLE|LIMITED|FAULT|OFFLINE")
+    received = body.received_at or datetime.utcnow()
+    row = AbsorptionStatus(device_id=dev.id, state=body.state,
+                           observed_at=body.observed_at, received_at=received,
+                           max_absorb_kwh_per_min=body.max_absorb_kwh_per_min,
+                           note=body.note)
+    db.add(row)
+    db.flush()
+    affected = auto_rederive_after_status(db, row)
+    db.commit()
+    late = (received - body.observed_at).total_seconds() > LATE_ARRIVAL_SECONDS
+    return {"inserted": 1, "late": late, "zone": dev.supply_zone,
+            "new_derivations": affected}
+
+
+@router.get("/absorption-devices")
+def list_absorption_devices(db: Session = Depends(get_db),
+                            _: User = Depends(current_user)):
+    out = []
+    for d in db.query(AbsorptionDevice).all():
+        st = (db.query(AbsorptionStatus).filter(AbsorptionStatus.device_id == d.id)
+              .order_by(AbsorptionStatus.observed_at.desc()).first())
+        out.append({"id": d.id, "serial": d.serial, "kind": d.kind,
+                    "supply_zone": d.supply_zone, "station_name": d.station_name,
+                    "rated_kwh": d.rated_kwh,
+                    "latest_status": None if not st else {
+                        "state": st.state, "observed_at": st.observed_at.isoformat(),
+                        "received_at": st.received_at.isoformat(),
+                        "late": (st.received_at - st.observed_at).total_seconds()
+                                > LATE_ARRIVAL_SECONDS}})
+    return out

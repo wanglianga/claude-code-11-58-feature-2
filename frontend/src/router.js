@@ -10,6 +10,7 @@ const routes = [
       { path: 'readings', component: () => import('./views/Readings.vue') },
       { path: 'runs', component: () => import('./views/Runs.vue') },
       { path: 'runs/:id', component: () => import('./views/RunDetail.vue') },
+      { path: 'runs/:id/regen', component: () => import('./views/Regen.vue') },
       { path: 'metrics', component: () => import('./views/Metrics.vue') },
       { path: 'replay', component: () => import('./views/Replay.vue') },
     ],

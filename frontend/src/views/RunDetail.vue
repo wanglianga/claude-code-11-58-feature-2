@@ -12,6 +12,10 @@
             {{ run.train }}({{ run.vehicle_model }}) · {{ run.line }} · {{ run.driver_mode }} ·
             {{ run.distance_km }}km · {{ run.passengers }}人 · {{ run.shift }}
           </span>
+          <el-button type="primary" size="small" plain
+                     @click="$router.push(`/runs/${run.id}/regen`)">
+            回馈去向推导
+          </el-button>
         </div>
       </template>
       <el-alert v-if="run.supersedes_id" type="warning" :closable="false"
